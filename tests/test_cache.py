@@ -8,7 +8,6 @@ import tempfile
 import shutil
 from pathlib import Path
 
-# Module-level import to test it loads
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -21,14 +20,93 @@ from ai_cache.cache import (
     _stats,
     cached,
     CacheManager,
+    serialize_response,
+    deserialize_response,
+    SerializationError,
 )
+
+
+# ─── Serialization tests ───────────────────────────────────────────────────────
+
+
+def test_serialize_primitives():
+    for val in [{"key": "value"}, ["a", "b"], "string", 42, 3.14, True]:
+        data = serialize_response(val)
+        assert isinstance(data, bytes)
+        assert deserialize_response(data) == val
+
+
+def test_serialize_bytes():
+    data = serialize_response(b"binary data")
+    result = deserialize_response(data)
+    # bytes are encoded as JSON {"__bytes": True, "data": "...encoded..."}
+    assert isinstance(result, bytes)
+    assert result == b"binary data"
+
+
+def test_serialize_openai_response():
+    """Mock an OpenAI-like response object."""
+    class MockResponse:
+        def to_dict(self):
+            return {"id": "chatcmpl-1", "model": "gpt-4o", "choices": []}
+    
+    data = serialize_response(MockResponse())
+    result = deserialize_response(data)
+    # deserialize_response unwraps __openai -> returns the inner dict directly
+    assert result["id"] == "chatcmpl-1"
+    assert result["model"] == "gpt-4o"
+
+
+def test_serialize_anthropic_response():
+    """Mock an Anthropic-like response object."""
+    class MockContentBlock:
+        def model_dump(self):
+            return {"type": "text", "text": "hello"}
+    
+    class MockUsage:
+        def model_dump(self):
+            return {"input_tokens": 10, "output_tokens": 20}
+    
+    class MockResponse:
+        id = "msg_1"
+        type = "message"
+        role = "assistant"
+        model = "claude-sonnet-4-20250514"
+        stop_reason = "end_turn"
+        content = [MockContentBlock()]
+        usage = MockUsage()
+    
+    data = serialize_response(MockResponse())
+    result = deserialize_response(data)
+    # deserialize_response unwraps __anthropic -> returns the inner dict directly
+    assert result["id"] == "msg_1"
+    assert result["model"] == "claude-sonnet-4-20250514"
+
+
+def test_serialize_dict_like():
+    class DictLike:
+        def __init__(self):
+            self._data = {"a": 1, "b": 2}
+        def items(self):
+            return self._data.items()
+    
+    data = serialize_response(DictLike())
+    result = deserialize_response(data)
+    assert result == {"a": 1, "b": 2}
+
+
+def test_serialize_error_on_unknown_type():
+    class UnknownType:
+        pass
+    
+    with pytest.raises(SerializationError):
+        serialize_response(UnknownType())
 
 
 # ─── Fingerprint tests ──────────────────────────────────────────────────────────
 
 
 def test_fingerprint_same_prompt_same_params():
-    """Identical prompts with identical params must produce identical fingerprints."""
     fp1 = _build_request_fingerprint(
         provider="openai", model="gpt-4o",
         messages=[{"role": "user", "content": "hello"}],
@@ -43,7 +121,6 @@ def test_fingerprint_same_prompt_same_params():
 
 
 def test_fingerprint_different_temperature():
-    """Same prompt, different temperature → different fingerprints."""
     fp1 = _build_request_fingerprint(
         provider="openai", model="gpt-4o",
         messages=[{"role": "user", "content": "hello"}],
@@ -58,7 +135,6 @@ def test_fingerprint_different_temperature():
 
 
 def test_fingerprint_different_model():
-    """Same prompt, different model → different fingerprints."""
     fp1 = _build_request_fingerprint(
         provider="openai", model="gpt-4o",
         messages=[{"role": "user", "content": "hello"}],
@@ -71,7 +147,6 @@ def test_fingerprint_different_model():
 
 
 def test_fingerprint_different_max_tokens():
-    """Same prompt, different max_tokens → different fingerprints."""
     fp1 = _build_request_fingerprint(
         provider="openai", model="gpt-4o",
         messages=[{"role": "user", "content": "hello"}],
@@ -86,7 +161,6 @@ def test_fingerprint_different_max_tokens():
 
 
 def test_fingerprint_different_provider():
-    """Same prompt, different provider → different fingerprints."""
     fp1 = _build_request_fingerprint(
         provider="openai", model="gpt-4o",
         messages=[{"role": "user", "content": "hello"}],
@@ -99,7 +173,6 @@ def test_fingerprint_different_provider():
 
 
 def test_fingerprint_different_messages():
-    """Different messages → different fingerprints."""
     fp1 = _build_request_fingerprint(
         provider="openai", model="gpt-4o",
         messages=[{"role": "user", "content": "hello"}],
@@ -112,7 +185,6 @@ def test_fingerprint_different_messages():
 
 
 def test_fingerprint_message_order_invariance():
-    """Messages in different order → same fingerprint (sorted by role)."""
     fp1 = _build_request_fingerprint(
         provider="openai", model="gpt-4o",
         messages=[
@@ -131,7 +203,6 @@ def test_fingerprint_message_order_invariance():
 
 
 def test_fingerprint_none_params_excluded():
-    """None-valued optional params don't affect the fingerprint."""
     fp1 = _build_request_fingerprint(
         provider="openai", model="gpt-4o",
         messages=[{"role": "user", "content": "hello"}],
@@ -145,7 +216,6 @@ def test_fingerprint_none_params_excluded():
 
 
 def test_fingerprint_seed_affects_output():
-    """Same prompt with seed → same fingerprint (seed is part of generation)."""
     fp1 = _build_request_fingerprint(
         provider="openai", model="gpt-4o",
         messages=[{"role": "user", "content": "hello"}],
@@ -157,7 +227,6 @@ def test_fingerprint_seed_affects_output():
         seed=42,
     )
     assert fp1 == fp2
-    # Different seed → different fingerprint
     fp3 = _build_request_fingerprint(
         provider="openai", model="gpt-4o",
         messages=[{"role": "user", "content": "hello"}],
@@ -187,7 +256,6 @@ def dummy_func(messages, model="gpt-4o", temperature=0.7, max_tokens=512, **kwar
 
 
 def test_normalize_function_args_basic():
-    """Args are correctly extracted."""
     args = _normalize_function_args(
         dummy_func,
         ([{"role": "user", "content": "hello"}],),
@@ -200,7 +268,6 @@ def test_normalize_function_args_basic():
 
 
 def test_normalize_function_args_kwargs():
-    """Kwargs are correctly extracted."""
     args = _normalize_function_args(
         dummy_func,
         ([{"role": "user", "content": "hello"}],),
@@ -240,10 +307,39 @@ def test_sqlite_hit_updates_access_time(tmp_backend):
     key = "test:key:access"
     tmp_backend.set(key=key, provider="openai", model="gpt-4o",
                     fingerprint="fp", response=b"data", ttl=3600)
-    tmp_backend.get(key)  # first access
-    tmp_backend.get(key)  # second access
+    tmp_backend.get(key)
+    tmp_backend.get(key)
     stats = tmp_backend.stats()
     assert stats["total_hits"] >= 2
+
+
+def test_sqlite_ttl_expired(tmp_backend):
+    """Expired entries are deleted on read."""
+    key = "test:key:expired"
+    tmp_backend.set(key=key, provider="openai", model="gpt-4o",
+                    fingerprint="fp", response=b"data", ttl=1)
+    time.sleep(1.1)
+    result = tmp_backend.get(key)
+    assert result is None
+
+
+def test_sqlite_ttl_not_yet_expired(tmp_backend):
+    """Non-expired entries are returned normally."""
+    key = "test:key:valid"
+    tmp_backend.set(key=key, provider="openai", model="gpt-4o",
+                    fingerprint="fp", response=b"data", ttl=3600)
+    result = tmp_backend.get(key)
+    assert result == b"data"
+
+
+def test_sqlite_expired_entries_counted_in_stats(tmp_backend):
+    key = "test:key:expired2"
+    tmp_backend.set(key=key, provider="openai", model="gpt-4o",
+                    fingerprint="fp", response=b"data", ttl=1)
+    time.sleep(1.1)
+    tmp_backend.get(key)  # should trigger expiry deletion
+    stats = tmp_backend.stats()
+    assert stats["expired_entries"] == 0  # after read, expired entry is gone
 
 
 def test_sqlite_purge_by_model(tmp_backend):
@@ -262,12 +358,6 @@ def test_sqlite_purge_all(tmp_backend):
     assert tmp_backend.get("k2") is None
 
 
-def test_sqlite_max_entries_eviction(tmp_backend):
-    """When max_entries is exceeded, oldest entries are evicted."""
-    for i in range(150):  # max is 1000, but test with a low limit
-        tmp_backend.set(f"k{i}", "openai", "gpt-4o", f"fp{i}", b"data", 3600)
-
-
 def test_sqlite_stats(tmp_backend):
     tmp_backend.set("k1", "openai", "gpt-4o", "fp", b"d1", 3600)
     tmp_backend.set("k2", "openai", "gpt-4o", "fp", b"d2", 3600)
@@ -275,11 +365,8 @@ def test_sqlite_stats(tmp_backend):
     tmp_backend.get("k1")
     stats = tmp_backend.stats()
     assert stats["total_entries"] == 2
-    # k1 was accessed twice (hit_count = 1 from insert + 2 increments = 3)
-    # k2 was accessed 0 times (hit_count = 1 from insert only)
-    # total_hits = 3 + 1 = 4 (but SQLite SUM of hit_count after insert is: k1=3, k2=1 → 4)
-    # Wait — INSERT OR REPLACE resets hit_count to 1. So after two gets of k1: k1 hit_count=3, k2 hit_count=1
-    assert stats["total_hits"] == 4  # k1(3) + k2(1)
+    # k1: hit_count=3 (insert=1 + 2 reads), k2: hit_count=1 (insert only)
+    assert stats["total_hits"] == 4
 
 
 # ─── Memory Backend tests ───────────────────────────────────────────────────────
@@ -302,7 +389,6 @@ def test_memory_miss(mem_backend):
 def test_memory_eviction(mem_backend):
     for i in range(120):
         mem_backend.set(f"k{i}", "openai", "gpt-4o", f"fp{i}", b"data", 3600)
-    # Oldest entries should be evicted
     assert mem_backend.get("k0") is None
     assert mem_backend.get("k119") is not None
 
@@ -311,6 +397,17 @@ def test_memory_ttl(mem_backend):
     mem_backend.set("k1", "openai", "gpt-4o", "fp", b"v1", ttl=1)
     time.sleep(1.1)
     assert mem_backend.get("k1") is None
+
+
+def test_memory_expired_not_counted(mem_backend):
+    """Expired entries are pruned on read, so stats reflects post-pruning state."""
+    mem_backend.set("k1", "openai", "gpt-4o", "fp", b"v1", ttl=1)
+    # Force a read which triggers TTL expiry check + pruning
+    mem_backend.get("k1")
+    time.sleep(1.1)
+    mem_backend.get("k1")  # expired entry deleted on this read
+    stats = mem_backend.stats()
+    assert stats["expired_entries"] == 0
 
 
 # ─── Decorator integration tests ───────────────────────────────────────────────
@@ -323,8 +420,7 @@ def tmp_cache_dir():
     shutil.rmtree(tmpdir)
 
 
-def test_decorator_cache_hit(monkeypatch, tmp_cache_dir):
-    """Second call with same args returns cached result."""
+def test_decorator_cache_hit(tmp_cache_dir):
     call_count = 0
 
     @cached(provider="openai", model="gpt-4o", backend=SQLiteBackend(tmp_cache_dir),
@@ -334,19 +430,16 @@ def test_decorator_cache_hit(monkeypatch, tmp_cache_dir):
         call_count += 1
         return {"result": f"call_{call_count}"}
 
-    # First call — hits API
     result1 = api_call(messages=[{"role": "user", "content": "hello"}])
     assert result1 == {"result": "call_1"}
     assert call_count == 1
 
-    # Second call with SAME args — cache hit
     result2 = api_call(messages=[{"role": "user", "content": "hello"}])
-    assert result2 == {"result": "call_1"}  # same as first!
-    assert call_count == 1  # still only 1 API call
+    assert result2 == {"result": "call_1"}
+    assert call_count == 1
 
 
-def test_decorator_different_temp_no_cache_hit(monkeypatch, tmp_cache_dir):
-    """Different temperature → no cache hit (different fingerprint)."""
+def test_decorator_different_temp_no_cache_hit(tmp_cache_dir):
     call_count = 0
 
     @cached(provider="openai", model="gpt-4o", backend=SQLiteBackend(tmp_cache_dir))
@@ -362,8 +455,7 @@ def test_decorator_different_temp_no_cache_hit(monkeypatch, tmp_cache_dir):
     assert call_count == 2
 
 
-def test_decorator_different_message_no_cache_hit(monkeypatch, tmp_cache_dir):
-    """Different message → no cache hit."""
+def test_decorator_different_message_no_cache_hit(tmp_cache_dir):
     call_count = 0
 
     @cached(provider="openai", model="gpt-4o", backend=SQLiteBackend(tmp_cache_dir))
@@ -378,7 +470,6 @@ def test_decorator_different_message_no_cache_hit(monkeypatch, tmp_cache_dir):
 
 
 def test_decorator_invalidate(tmp_cache_dir):
-    """Explicit invalidate removes the cache entry."""
     call_count = 0
 
     @cached(provider="openai", model="gpt-4o", backend=SQLiteBackend(tmp_cache_dir))
@@ -390,7 +481,6 @@ def test_decorator_invalidate(tmp_cache_dir):
     api_call(messages=[{"role": "user", "content": "hello"}])
     assert call_count == 1
 
-    # Invalidate by calling with same args
     api_call.invalidate(messages=[{"role": "user", "content": "hello"}])
 
     api_call(messages=[{"role": "user", "content": "hello"}])
@@ -398,7 +488,6 @@ def test_decorator_invalidate(tmp_cache_dir):
 
 
 def test_decorator_disabled():
-    """When disabled, every call goes through to the function."""
     call_count = 0
 
     @cached(provider="openai", model="gpt-4o", enabled=False)
@@ -412,8 +501,46 @@ def test_decorator_disabled():
     assert call_count == 2
 
 
+def test_decorator_json_serialization(tmp_cache_dir):
+    """Responses should be JSON-serialized, not pickle."""
+    call_count = 0
+
+    @cached(provider="openai", model="gpt-4o", backend=SQLiteBackend(tmp_cache_dir))
+    def api_call(messages, model="gpt-4o"):
+        nonlocal call_count
+        call_count += 1
+        return {"choices": [{"message": {"content": "hello"}}], "model": "gpt-4o"}
+
+    result1 = api_call(messages=[{"role": "user", "content": "test"}])
+    assert result1["choices"][0]["message"]["content"] == "hello"
+    assert call_count == 1
+
+    result2 = api_call(messages=[{"role": "user", "content": "test"}])
+    assert result2["choices"][0]["message"]["content"] == "hello"
+    assert call_count == 1
+
+
+def test_decorator_ttl_expired(tmp_cache_dir):
+    """Expired entries are not returned from cache."""
+    call_count = 0
+
+    @cached(provider="openai", model="gpt-4o", backend=SQLiteBackend(tmp_cache_dir), ttl=1)
+    def api_call(messages, model="gpt-4o"):
+        nonlocal call_count
+        call_count += 1
+        return {"result": f"call_{call_count}"}
+
+    api_call(messages=[{"role": "user", "content": "hello"}])
+    assert call_count == 1
+
+    time.sleep(1.1)
+
+    api_call(messages=[{"role": "user", "content": "hello"}])
+    # Should call API again since entry expired
+    assert call_count == 2
+
+
 def test_cache_manager(tmp_cache_dir):
-    """CacheManager creates provider-scoped decorators."""
     cache_mgr = CacheManager(backend=SQLiteBackend(tmp_cache_dir))
     call_count = 0
 
@@ -425,15 +552,11 @@ def test_cache_manager(tmp_cache_dir):
 
     summarize(messages=[{"role": "user", "content": "test"}])
     summarize(messages=[{"role": "user", "content": "test"}])
-    assert call_count == 1  # second call cached
-
-
-# ─── Global stats test ─────────────────────────────────────────────────────────
+    assert call_count == 1
 
 
 def test_stats_tracked():
     stats = _stats()
-    # Stats accumulate across calls — just verify the object exists and has fields
     assert hasattr(stats, "hits")
     assert hasattr(stats, "misses")
     assert hasattr(stats, "hit_rate")

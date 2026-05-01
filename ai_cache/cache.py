@@ -7,6 +7,8 @@ Key design (solves the hard problems):
 3. Collision resistance — SHA256(full_payload) + a BLOB lookup, not just hash-as-key
 4. Model versioning — model change auto-invalidates; hash prefix is the model+version
 5. Content-addressed storage — key IS the content hash; collision = identical content
+6. TTL enforcement — entries expire and are cleaned up on read
+7. Portable serialization — JSON everywhere, no pickle, Redis-compatible
 """
 
 import hashlib
@@ -14,13 +16,132 @@ import json
 import sqlite3
 import time
 import os
-import asyncio
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 import threading
 import contextlib
+
+try:
+    import orjson as json_lib
+    def _json_dumps(obj: Any) -> bytes:
+        return json_lib.dumps(obj)
+    def _json_loads(data: bytes) -> Any:
+        return json_lib.loads(data)
+except ImportError:
+    import json as json_stdlib
+    json_lib = json_stdlib
+    def _json_dumps(obj: Any) -> bytes:
+        return json_stdlib.dumps(obj).encode("utf-8")
+    def _json_loads(data: bytes) -> Any:
+        return json_stdlib.loads(data.decode("utf-8"))
+
+
+# ─── Serializers ────────────────────────────────────────────────────────────────
+#
+# Serialize response objects to portable JSON bytes.
+# Must be JSON-compatible so Redis can share across non-Python clients.
+# Provider-specific extraction handles non-JSON-native response objects.
+#
+# ────────────────────────────────────────────────────────────────────────────────
+
+
+class SerializationError(Exception):
+    """Raised when a response object can't be serialized."""
+
+
+def serialize_response(response: Any) -> bytes:
+    """
+    Serialize any provider response to JSON bytes.
+    
+    Handles:
+    - OpenAI ChatCompletion response objects (via .to_dict() or model_dump())
+    - Anthropic message response objects (via .model_dump() or dict access)
+    - Already-serializable dict/list/str/int/float types
+    - bytes (decode to string)
+    """
+    if response is None:
+        return b'""'
+    
+    # Already a primitive
+    if isinstance(response, (dict, list, str, int, float, bool)):
+        return _json_dumps(response)
+    
+    # bytes
+    if isinstance(response, bytes):
+        return _json_dumps({"__bytes": True, "data": response.decode("latin-1")})
+    
+    # OpenAI response object — has .to_dict() or .model_dump()
+    if hasattr(response, "to_dict"):
+        try:
+            return _json_dumps({"__openai": True, "data": response.to_dict()})
+        except Exception:
+            pass
+    if hasattr(response, "model_dump"):
+        try:
+            return _json_dumps({"__openai": True, "data": response.model_dump()})
+        except Exception:
+            pass
+    
+    # Anthropic response object
+    if hasattr(response, "content") and hasattr(response, "id"):
+        try:
+            return _json_dumps({
+                "__anthropic": True,
+                "data": {
+                    "id": response.id,
+                    "type": getattr(response, "type", "message"),
+                    "role": getattr(response, "role", "assistant"),
+                    "content": [c.model_dump() if hasattr(c, "model_dump") else c for c in response.content]
+                        if hasattr(response, "content") else [],
+                    "usage": response.usage.model_dump() if hasattr(response, "usage") else None,
+                    "model": getattr(response, "model", ""),
+                    "stop_reason": getattr(response, "stop_reason", None),
+                }
+            })
+        except Exception:
+            pass
+    
+    # Dict-like objects
+    if hasattr(response, "items"):
+        try:
+            return _json_dumps(dict(response.items()))
+        except Exception:
+            pass
+    
+    # Last resort — try model_dump if it exists
+    if hasattr(response, "model_dump"):
+        try:
+            return _json_dumps(response.model_dump())
+        except Exception:
+            pass
+    
+    raise SerializationError(
+        f"Cannot serialize response of type {type(response).__name__}. "
+        f"Wrap it with @cached(serializer=my_serializer) or return a dict."
+    )
+
+
+def deserialize_response(data: bytes) -> Any:
+    """Reconstruct a response object from JSON bytes."""
+    if not data:
+        return None
+    obj = _json_loads(data)
+    
+    # Wrapped types — check before general dict/list
+    if isinstance(obj, dict):
+        if obj.get("__bytes"):
+            return obj["data"].encode("latin-1")
+        if obj.get("__openai") or obj.get("__anthropic"):
+            return obj["data"]
+    
+    # Primitives — return as-is
+    if isinstance(obj, (dict, list, str, int, float, bool)):
+        return obj
+    
+    return obj
+
 
 # ─── Key Anatomy ───────────────────────────────────────────────────────────────
 #
@@ -155,8 +276,8 @@ def _build_request_fingerprint(
         fingerprint_data["response_format"] = kwargs["response_format"]
 
     # Sort + serialize deterministically
-    serialized = json.dumps(fingerprint_data, sort_keys=True, ensure_ascii=True)
-    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    serialized = json_lib.dumps(fingerprint_data, option=json_lib.OPT_SORT_KEYS)
+    return hashlib.sha256(serialized).hexdigest()
 
 
 def _normalize_function_args(func: Callable, args, kwargs) -> dict:
@@ -190,7 +311,7 @@ def _normalize_function_args(func: Callable, args, kwargs) -> dict:
     return result
 
 
-# ─── SQLite Backend ────────────────────────────────────────────────────────────
+# ─── SQLite Backend ─────────────────────────────────────────────────────────────
 
 
 class SQLiteBackend:
@@ -198,20 +319,22 @@ class SQLiteBackend:
     Content-addressed SQLite cache.
 
     Key = sha256(provider:model:fingerprint)
-    Value = serialized response (json for chat completions)
+    Value = JSON-serialized response (portable across Python versions)
 
     Schema:
         CREATE TABLE cache (
-            key TEXT PRIMARY KEY,      -- sha256 hex
-            provider TEXT,
-            model TEXT,
-            created_at REAL,            -- unix timestamp
-            last_accessed REAL,         -- unix timestamp
-            response BLOB,              -- raw response bytes
-            request_fingerprint TEXT,   -- full request hash for verification
+            key TEXT PRIMARY KEY,          -- sha256 hex
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            created_at REAL NOT NULL,      -- unix timestamp
+            expires_at REAL NOT NULL,      -- unix timestamp (TTL enforcement)
+            last_accessed REAL,             -- unix timestamp
+            response BLOB NOT NULL,         -- JSON bytes
+            request_fingerprint TEXT NOT NULL,
             hit_count INTEGER DEFAULT 1
         );
         CREATE INDEX idx_model ON cache(provider, model);
+        CREATE INDEX idx_expires ON cache(expires_at);
         CREATE INDEX idx_created ON cache(created_at);
     """
 
@@ -238,19 +361,40 @@ class SQLiteBackend:
                 provider TEXT NOT NULL,
                 model TEXT NOT NULL,
                 created_at REAL NOT NULL,
-                last_accessed REAL NOT NULL,
+                expires_at REAL NOT NULL,
+                last_accessed REAL,
                 response BLOB NOT NULL,
                 request_fingerprint TEXT NOT NULL,
                 hit_count INTEGER DEFAULT 1
             )
         """)
+        # Add expires_at column if migrating from older schema (no-op if already exists)
+        try:
+            conn.execute("ALTER TABLE cache ADD COLUMN expires_at REAL")
+        except sqlite3.OperationalError:
+            pass  # already exists
+        try:
+            conn.execute("ALTER TABLE cache ADD COLUMN last_accessed REAL")
+        except sqlite3.OperationalError:
+            pass
         conn.execute("CREATE INDEX IF NOT EXISTS idx_model ON cache(provider, model)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_expires ON cache(expires_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_created ON cache(created_at)")
         conn.commit()
 
     def _enforce_limits(self):
-        """Evict oldest entries when limits are reached."""
+        """Evict oldest entries when limits are reached, or when expired."""
         conn = self._get_conn()
+        now = time.time()
+
+        # Evict expired entries on every write
+        count = conn.execute(
+            "SELECT COUNT(*) FROM cache WHERE expires_at < ?",
+            (now,),
+        ).fetchone()[0]
+        if count > 0:
+            conn.execute("DELETE FROM cache WHERE expires_at < ?", (now,))
+            conn.commit()
 
         # Check entry count
         count = conn.execute("SELECT COUNT(*) FROM cache").fetchone()[0]
@@ -263,39 +407,47 @@ class SQLiteBackend:
             conn.commit()
 
         # Check size
-        db_size_mb = self.db_path.stat().st_size / (1024 * 1024)
-        if db_size_mb >= self.max_size_mb:
-            conn.execute("""
-                DELETE FROM cache WHERE key IN (
-                    SELECT key FROM cache ORDER BY created_at ASC LIMIT ?
-                )
-            """, (max(100, int(self.max_entries * 0.1)),))
-            conn.commit()
+        if self.db_path.exists():
+            db_size_mb = self.db_path.stat().st_size / (1024 * 1024)
+            if db_size_mb >= self.max_size_mb:
+                conn.execute("""
+                    DELETE FROM cache WHERE key IN (
+                        SELECT key FROM cache ORDER BY created_at ASC LIMIT ?
+                    )
+                """, (max(100, int(self.max_entries * 0.1)),))
+                conn.commit()
 
     def get(self, key: str) -> Optional[bytes]:
         conn = self._get_conn()
+        now = time.time()
         row = conn.execute(
-            "SELECT response, request_fingerprint FROM cache WHERE key = ?",
+            "SELECT response, expires_at FROM cache WHERE key = ?",
             (key,),
         ).fetchone()
-        if row:
-            conn.execute(
-                "UPDATE cache SET last_accessed = ?, hit_count = hit_count + 1 WHERE key = ?",
-                (time.time(), key),
-            )
+        if row is None:
+            return None
+        # TTL enforcement — check expiry before returning
+        if row["expires_at"] < now:
+            conn.execute("DELETE FROM cache WHERE key = ?", (key,))
             conn.commit()
-            return row["response"]
-        return None
+            return None
+        conn.execute(
+            "UPDATE cache SET last_accessed = ?, hit_count = hit_count + 1 WHERE key = ?",
+            (now, key),
+        )
+        conn.commit()
+        return row["response"]
 
     def set(self, key: str, provider: str, model: str, fingerprint: str, response: bytes, ttl: int):
         conn = self._get_conn()
         now = time.time()
+        expires_at = now + ttl
         try:
             conn.execute("""
                 INSERT OR REPLACE INTO cache
-                (key, provider, model, created_at, last_accessed, response, request_fingerprint, hit_count)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 1)
-            """, (key, provider, model, now, now, response, fingerprint))
+                (key, provider, model, created_at, expires_at, last_accessed, response, request_fingerprint, hit_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+            """, (key, provider, model, now, expires_at, now, response, fingerprint))
             conn.commit()
             self._enforce_limits()
         except sqlite3.IntegrityError:
@@ -308,6 +460,7 @@ class SQLiteBackend:
 
     def purge(self, provider: Optional[str] = None, model: Optional[str] = None):
         conn = self._get_conn()
+        now = time.time()
         if provider and model:
             conn.execute("DELETE FROM cache WHERE provider = ? AND model = ?", (provider, model))
         elif provider:
@@ -318,16 +471,15 @@ class SQLiteBackend:
 
     def stats(self) -> dict:
         conn = self._get_conn()
-        row = conn.execute("""
-            SELECT COUNT(*) as total, SUM(hit_count) as hits
-            FROM cache
-        """).fetchone()
-        total = row["total"] or 0
-        hits = row["hits"] or 0
+        now = time.time()
+        total = conn.execute("SELECT COUNT(*) FROM cache").fetchone()[0]
+        hits = conn.execute("SELECT SUM(hit_count) FROM cache").fetchone()[0] or 0
+        expired = conn.execute("SELECT COUNT(*) FROM cache WHERE expires_at < ?", (now,)).fetchone()[0]
         misses = _stats().misses
         db_size_mb = self.db_path.stat().st_size / (1024 * 1024) if self.db_path.exists() else 0
         return {
             "total_entries": total,
+            "expired_entries": expired,
             "total_hits": hits,
             "estimated_misses": misses,
             "hit_rate": hits / (hits + misses) if (hits + misses) > 0 else 0.0,
@@ -343,14 +495,13 @@ class SQLiteBackend:
 
 
 class RedisBackend:
-    """Redis-backed cache for team sharing."""
+    """Redis-backed cache for team sharing. Uses JSON serialization."""
 
     def __init__(self, redis_url: str, ttl: int = 3600):
         import redis as redis_lib
-
         self.redis_url = redis_url
         self._client = redis_lib.from_url(redis_url, decode_responses=False)
-        self.ttl = ttl
+        self._ttl = ttl
 
     def get(self, key: str) -> Optional[bytes]:
         val = self._client.get(key)
@@ -360,13 +511,15 @@ class RedisBackend:
 
     def set(self, key: str, provider: str, model: str, fingerprint: str, response: bytes, ttl: int):
         pipe = self._client.pipeline()
-        pipe.set(key, response, ex=ttl)
+        effective_ttl = ttl if ttl > 0 else self._ttl
+        pipe.set(key, response, ex=effective_ttl)
         pipe.hset(f"{key}:meta", mapping={
             "provider": provider,
             "model": model,
             "fingerprint": fingerprint,
             "created_at": time.time(),
         })
+        pipe.expire(f"{key}:meta", effective_ttl)
         pipe.execute()
 
     def delete(self, key: str):
@@ -394,7 +547,7 @@ class MemoryBackend:
     """In-memory cache for single-process/CI use. Evicts on restart."""
 
     def __init__(self, max_entries: int = 10_000):
-        self._store: dict[str, tuple[bytes, float]] = {}  # key → (response, expiry)
+        self._store: dict[str, tuple[bytes, float]] = {}  # key → (response, expires_at)
         self._max_entries = max_entries
         self._lock = threading.Lock()
 
@@ -403,8 +556,8 @@ class MemoryBackend:
             entry = self._store.get(key)
             if entry is None:
                 return None
-            response, expiry = entry
-            if expiry < time.time():
+            response, expires_at = entry
+            if expires_at < time.time():
                 del self._store[key]
                 return None
             return response
@@ -412,7 +565,7 @@ class MemoryBackend:
     def set(self, key: str, provider: str, model: str, fingerprint: str, response: bytes, ttl: int):
         with self._lock:
             if len(self._store) >= self._max_entries:
-                # Evict ~10% oldest
+                # Evict ~10% oldest by expiry
                 sorted_items = sorted(self._store.items(), key=lambda x: x[1][1])
                 for k, _ in sorted_items[: max(100, int(self._max_entries * 0.1))]:
                     del self._store[k]
@@ -427,15 +580,18 @@ class MemoryBackend:
             if provider and model:
                 prefix = f"{provider}:{model}:"
                 for k in list(self._store.keys()):
-                    if not k.startswith(prefix):
+                    if k.startswith(prefix):
                         del self._store[k]
             else:
                 self._store.clear()
 
     def stats(self) -> dict:
         with self._lock:
+            now = time.time()
+            expired = sum(1 for _, exp in self._store.values() if exp < now)
             return {
                 "total_entries": len(self._store),
+                "expired_entries": expired,
                 "backend": "memory",
             }
 
@@ -445,7 +601,6 @@ class MemoryBackend:
 
 def _get_backend(config: CacheConfig):
     backend = config.backend
-    # Accept Backend instances directly (for test ergonomics)
     if isinstance(backend, (SQLiteBackend, MemoryBackend, RedisBackend)):
         return backend
     if isinstance(backend, str):
@@ -460,26 +615,6 @@ def _get_backend(config: CacheConfig):
         return MemoryBackend()
     else:
         raise ValueError(f"Unknown backend: {backend}")
-
-
-# ─── Provider API Wrappers ──────────────────────────────────────────────────────
-#
-# Each provider adapter wraps the provider's chat API and extracts args
-# in a way that feeds _build_request_fingerprint correctly.
-#
-# ────────────────────────────────────────────────────────────────────────────────
-
-
-def _call_openai(func: Callable, args, kwargs) -> Any:
-    """Direct passthrough — actual call happens in the wrapper."""
-    return func(*args, **kwargs)
-
-
-_PROVIDER_ADAPTERS = {}
-
-
-def _get_adapter(provider: str):
-    return _PROVIDER_ADAPTERS.get(provider.lower(), _call_openai)
 
 
 # ─── Core Decorator ─────────────────────────────────────────────────────────────
@@ -524,8 +659,9 @@ def cached(
         - model change → different cache entry
         - temperature change → different cache entry
         - stream vs non-stream → different cache entry
+
+    TTL: entries expire after `ttl` seconds. Expired entries are deleted on read.
     """
-    # Allow passing a CacheConfig as the single argument
     if isinstance(backend, CacheConfig):
         config = backend
     else:
@@ -544,7 +680,6 @@ def cached(
     _backend = _get_backend(config)
 
     def decorator(func: Callable) -> Callable:
-        # Infer model from decorator arg or function docstring/defaults
         effective_model = model or config.model
 
         @contextlib.wraps(func)
@@ -552,14 +687,13 @@ def cached(
             if not config.enabled:
                 return func(*args, **kwargs)
 
-            # Build fingerprint from actual call args
             call_args = _normalize_function_args(func, args, kwargs)
             effective_provider = call_args.get("provider", config.provider)
-            effective_model_from_args = call_args.get("model") or effective_model
+            model_from_args = call_args.get("model") or effective_model
 
             fingerprint = _build_request_fingerprint(
                 provider=effective_provider,
-                model=effective_model,
+                model=model_from_args,  # FIX: was using decorator `model`, now uses runtime-resolved model
                 messages=call_args.get("messages", []),
                 temperature=call_args.get("temperature"),
                 max_tokens=call_args.get("max_tokens"),
@@ -570,16 +704,14 @@ def cached(
                    if k in ("response_format",)},
             )
 
-            cache_key = f"{effective_provider}:{effective_model_from_args}:{fingerprint}"
+            cache_key = f"{effective_provider}:{model_from_args}:{fingerprint}"
 
             # ── Cache lookup ────────────────────────────────────────────────────
             cached_response = _backend.get(cache_key)
             if cached_response is not None:
                 with _global_lock:
                     _stats().hits += 1
-                # Deserialize and return
-                import pickle
-                return pickle.loads(cached_response)
+                return deserialize_response(cached_response)
 
             # ── Cache miss: call the actual function ─────────────────────────────
             with _global_lock:
@@ -587,18 +719,19 @@ def cached(
 
             result = func(*args, **kwargs)
 
-            # Serialize and store
-            import pickle
+            # Serialize and store (JSON — no pickle, Redis-compatible)
             try:
-                serialized = pickle.dumps(result)
+                serialized = serialize_response(result)
                 _backend.set(
                     key=cache_key,
                     provider=effective_provider,
-                    model=effective_model,
+                    model=model_from_args,
                     fingerprint=fingerprint,
                     response=serialized,
                     ttl=config.ttl,
                 )
+            except SerializationError:
+                raise
             except Exception:
                 pass  # cache write failures should not break the call
 
@@ -612,10 +745,10 @@ def cached(
             """Explicitly invalidate a cache entry."""
             call_args = _normalize_function_args(func, args, kwargs)
             effective_provider = call_args.get("provider", config.provider)
-            model_from_args = call_args.get("model") or effective_model
+            model_from_call = call_args.get("model") or effective_model
             fingerprint = _build_request_fingerprint(
                 provider=effective_provider,
-                model=model_from_args,
+                model=model_from_call,
                 messages=call_args.get("messages", []),
                 temperature=call_args.get("temperature"),
                 max_tokens=call_args.get("max_tokens"),
@@ -623,7 +756,7 @@ def cached(
                 seed=call_args.get("seed"),
                 stream=call_args.get("stream", False),
             )
-            cache_key = f"{effective_provider}:{model_from_args}:{fingerprint}"
+            cache_key = f"{effective_provider}:{model_from_call}:{fingerprint}"
             _backend.delete(cache_key)
 
         wrapper.invalidate = invalidate
@@ -633,7 +766,7 @@ def cached(
     return decorator
 
 
-# ─── Decorator with provider-specific API ─────────────────────────────────────
+# ─── CacheManager ───────────────────────────────────────────────────────────────
 
 
 class CacheManager:
@@ -645,14 +778,12 @@ class CacheManager:
 
         cache = CacheManager()
 
-        # OpenAI
         @cache.openai(model="gpt-4o")
-        def summarize(messages, temperature=0.7, max_tokens=512, **kwargs):
+        def summarize(messages, model="gpt-4o", temperature=0.7, max_tokens=512):
             return openai.chat.completions.create(...)
 
-        # Anthropic
         @cache.anthropic(model="claude-sonnet-4-20250514")
-        def think(messages, temperature=0.7, max_tokens=1024, **kwargs):
+        def think(messages, model="claude-sonnet-4-20250514", temperature=0.7, max_tokens=1024):
             return anthropic.messages.create(...)
     """
 
